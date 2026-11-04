@@ -1,0 +1,119 @@
+# 闲鱼比价监控 · 单轮抓取（GitHub Actions 免费方案）
+# 每 30 分钟跑一轮：抓一次闲鱼 → AI 判定 → 命中就推通知 → 立即退出，不常驻服务。
+# 上游项目：Usagi-org/ai-goofish-monitor，由本工作流在运行时克隆，你不需要把整个项目拷进仓库。
+name: goofish-monitor
+
+on:
+  schedule:
+    # GitHub 的 cron 用 UTC，*/30 每半小时一次；高峰期可能延迟或跳过，属正常现象。
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      debug_limit:
+        description: "调试：每个任务最多处理 N 个新商品（0 = 不限）"
+        required: false
+        default: "0"
+      task_name:
+        description: "只跑某个任务名（留空 = 跑 config.json 里所有 enabled 任务）"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+# 同一时间只跑一轮，避免两轮抢同一份登录态与结果库
+concurrency:
+  group: goofish-monitor
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: "https://github.com/Usagi-org/ai-goofish-monitor.git"
+  UPSTREAM_REF: "master"   # 建包时核验的 master 提交：77f8d75869acd65f9dba72731b95c7c49ea67bdf
+  PYTHON_VERSION: "3.11"
+  RUN_HEADLESS: "true"
+  RUNNING_IN_DOCKER: "true"  # 项目在非 Docker 模式下会强制用系统 Chrome，只有置 true 才用 Playwright 自带 Chromium
+  STATE_FILE: "state/acc_1.json"
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 取出本仓库里的配置
+        uses: actions/checkout@v4
+
+      - name: 克隆上游项目代码
+        run: git clone --depth 1 --branch "$UPSTREAM_REF" "$UPSTREAM_REPO" app
+
+      - name: 准备 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 缓存 pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('requirements-runtime.txt') }}
+          restore-keys: pip-${{ runner.os }}-
+
+      - name: 缓存 Playwright Chromium
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}-v1
+
+      - name: 安装 Python 依赖
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-runtime.txt
+
+      - name: 安装 Chromium 与系统依赖
+        run: python -m playwright install --with-deps chromium
+
+      - name: 恢复上一轮的结果库（用于商品去重与价格历史）
+        uses: actions/cache/restore@v4
+        with:
+          path: app/data
+          key: goofish-data-${{ github.run_id }}
+          restore-keys: |
+            goofish-data-
+
+      - name: 生成 .env（只从 Secrets 取值，不打印内容）
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          BARK_URL: ${{ secrets.BARK_URL }}
+          WX_BOT_URL: ${{ secrets.WX_BOT_URL }}
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+        run: python tools/write_env.py --app app
+
+      - name: 写回闲鱼登录态
+        env:
+          XIANYU_STATE_B64: ${{ secrets.XIANYU_STATE_B64 }}
+        run: python tools/decode_state.py --app app --state-file "$STATE_FILE"
+
+      - name: 单轮抓取
+        id: scrape
+        continue-on-error: true
+        env:
+          DEBUG_LIMIT: ${{ github.event.inputs.debug_limit || '0' }}
+          TASK_NAME: ${{ github.event.inputs.task_name || '' }}
+        run: bash run-once.sh --app app
+
+      - name: 写运行摘要
+        if: always()
+        run: python tools/run_summary.py --app app --log app/run.log >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 保存本轮结果库
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: app/data
+          key: goofish-data-${{ github.run_id }}
+
+      - name: 本轮失败即标记失败（会触发 GitHub 邮件通知）
+        if: steps.scrape.outcome == 'failure'
+        run: |
+          echo "本轮抓取失败，请看上方日志与运行摘要。" >&2
+          exit 1

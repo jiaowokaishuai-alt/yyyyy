@@ -1,0 +1,25 @@
+# 保活：公共仓库连续 60 天没有活动时，GitHub 会自动停用定时工作流。
+# 本工作流每月自动提交一次空变更，保证仓库始终有活动，定时任务不会被停用。
+name: keepalive
+
+on:
+  schedule:
+    - cron: "0 3 1 * *"   # 每月 1 日 UTC 03:00
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  touch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 提交一次空变更
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          date -u +"%Y-%m-%dT%H:%M:%SZ" >> .keepalive
+          git add .keepalive
+          git commit -m "keepalive $(date -u +%Y-%m-%d)"
+          git push
